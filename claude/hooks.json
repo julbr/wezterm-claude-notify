@@ -1,0 +1,35 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/wezterm-claude-notify.sh ATTENTION 'Claude needs your input'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/wezterm-claude-notify.sh DONE"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/wezterm-claude-notify.sh WORKING"
+          }
+        ]
+      }
+    ]
+  }
+}
