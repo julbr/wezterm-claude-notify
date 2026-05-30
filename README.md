@@ -36,7 +36,7 @@ brings WezTerm forward and switches to that exact tab.
 ## Install
 
 ```sh
-git clone https://github.com/<you>/wezterm-claude-notify.git
+git clone https://github.com/julbr/wezterm-claude-notify.git
 cd wezterm-claude-notify
 ./install.sh                 # or: ./install.sh --write-wezterm
 ```
