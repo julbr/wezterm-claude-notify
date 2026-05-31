@@ -43,7 +43,7 @@ bold "wezterm-claude-notify — installing"
 
 # 1) helper script -----------------------------------------------------------
 mkdir -p "$CLAUDE_DIR"
-install -m 0755 "$SCRIPT_DIR/bin/wezterm-status.sh" "$HELPER_DEST"
+install -m 0755 "$SCRIPT_DIR/bin/wezterm-claude-notify.sh" "$HELPER_DEST"
 ok "helper -> $HELPER_DEST"
 
 # 2) merge hooks into ~/.claude/settings.json (idempotent) -------------------

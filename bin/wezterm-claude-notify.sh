@@ -2,7 +2,7 @@
 # wezterm-claude-notify — reflect Claude Code session state into WezTerm.
 #
 # Called by Claude Code hooks with a status and (for alerts) a message:
-#   wezterm-status.sh <ATTENTION|DONE|WORKING> [toast message]
+#   wezterm-claude-notify.sh <ATTENTION|DONE|WORKING> [toast message]
 #     ATTENTION -> red tab  + clickable OS toast
 #     DONE      -> green tab
 #     WORKING   -> clears the highlight (tab back to normal)

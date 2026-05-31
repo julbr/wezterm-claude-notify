@@ -1,7 +1,7 @@
 -- wezterm-claude-notify — color WezTerm tabs by Claude Code session state, and
 -- make a clicked notification jump to the originating window's macOS Space + tab.
 --
--- A companion script (bin/wezterm-status.sh), driven by Claude Code hooks, sets
+-- A companion script (bin/wezterm-claude-notify.sh), driven by Claude Code hooks, sets
 -- a per-pane user var CLAUDE_STATUS to "ATTENTION", "DONE" or "" via an OSC 1337
 -- SetUserVar escape sequence. This module reads that var in format-tab-title and
 -- tints the tab. An alert auto-clears once you focus the tab (you've seen it).
@@ -44,7 +44,7 @@ local wezterm = require 'wezterm'
 local M = {}
 
 -- The user var the helper writes (base64) when an attention toast is CLICKED.
--- Must stay in lockstep with bin/wezterm-status.sh, which sets the same name.
+-- Must stay in lockstep with bin/wezterm-claude-notify.sh, which sets the same name.
 local FOCUS_VAR = 'CLAUDE_FOCUS_REQUEST'
 
 local defaults = {
