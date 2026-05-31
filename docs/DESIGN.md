@@ -11,13 +11,22 @@ Claude Code event (Notification / Stop / UserPromptSubmit)
         │  runs the configured hook command
         ▼
 ~/.claude/wezterm-claude-notify.sh  <STATUS> [message]
-        │  ├─ looks up THIS pane's tty device   (via $WEZTERM_PANE + `wezterm cli list`)
+        │  ├─ looks up THIS pane's tty device (via $WEZTERM_PANE + `wezterm cli list`)
         │  ├─ writes OSC 1337 SetUserVar=CLAUDE_STATUS=<base64> to that device
-        │  └─ posts a terminal-notifier toast with a click → `wezterm cli activate-pane`
+        │  └─ posts a terminal-notifier toast whose click → open WezTerm + write CLAUDE_FOCUS_REQUEST to the pane's tty
         ▼
 WezTerm sets the pane user var → repaints the tab bar
         ▼
 claude-notify.lua  format-tab-title  reads pane.user_vars.CLAUDE_STATUS → tints tab
+
+When the toast is CLICKED (separate flow, runs under /bin/sh, minimal PATH):
+        /usr/bin/open -a WezTerm                              (foreground WezTerm over the current app)
+        wezterm cli activate-pane --pane-id N                 (Mux tab select; also the old-build fallback)
+        printf OSC SetUserVar=CLAUDE_FOCUS_REQUEST > <tty>    (the pane's tty)
+        ▼
+claude-notify.lua  user-var-changed  → pane:activate() + window:focus()
+        → selects the tab, raises the OS window, and (an app focusing its own
+          window makes macOS follow) switches to that window's macOS Space
 ```
 
 ## Trap 1 — A hook cannot just `printf` an escape sequence
@@ -84,10 +93,11 @@ normally. A genuinely-new state (e.g. `ATTENTION → DONE`) differs from what yo
 acknowledged, so it re-alerts. The toast still fires regardless, so you never
 miss a same-state repeat even though the tab won't re-tint for it.
 
-Side note: the `user-var-changed` Lua event did **not** fire in the WezTerm
-build this was developed against (20240203), but it's irrelevant —
+Side note: tab *coloring* doesn't rely on the `user-var-changed` event at all —
 `format-tab-title` reads `user_vars` directly and WezTerm repaints the tab bar
-when a user var changes.
+when a user var changes. (The `user-var-changed` event *does* fire on this build,
+20240203 — verified empirically; it's the basis of click-to-focus below. An
+earlier draft of these notes claimed it didn't fire; that was wrong.)
 
 ## Why terminal-notifier for the toast (click-to-focus)
 
@@ -97,26 +107,105 @@ pane. (Native click-to-focus-pane was only added to WezTerm in a 2026 build via
 PR #7643; older builds can't do it at all.)
 
 `terminal-notifier` supports `-execute "<cmd>"`, run via `/bin/sh` when the
-notification is clicked. We set it to
-`wezterm cli activate-pane --pane-id N ; open -a WezTerm` so a click switches to
-the right tab and foregrounds WezTerm. Gotchas baked into the helper:
+notification is clicked. We use it to foreground WezTerm and hand a focus request
+back to WezTerm itself (see *Click-to-Space navigation* below). Gotchas baked
+into the helper:
 
 - **`-sender` and `-execute` are mutually exclusive** — `-sender` (which would
   set the WezTerm icon) disables the click command. We use `-appIcon` for the
   icon instead.
-- The clicked command runs with a **minimal PATH** → use absolute paths
-  (`/Applications/WezTerm.app/.../wezterm`, `/usr/bin/open`).
+- The clicked command runs with a **minimal PATH** (and an empty `LANG`) → use
+  absolute paths (`/Applications/WezTerm.app/.../wezterm`, `/usr/bin/open`).
 - `-group "wezterm-claude-<pane>"` coalesces repeated alerts from the same
   session instead of stacking them.
 - terminal-notifier is a separate app to macOS → it needs its **own**
   notification permission the first time.
 
-`wezterm cli activate-pane` switches the tab/pane but does **not** raise a
-specific OS *window*; `open -a WezTerm` foregrounds the app's frontmost window.
-For sessions-as-tabs-in-one-window this lands correctly. True multi-window
-raising would need AppleScript `AXRaise` by a unique window title (and an
-Accessibility permission) — intentionally omitted to keep the common case
-dependency-free.
+## Click-to-Space navigation (and its dead-ends)
+
+The goal: clicking a toast should land you on the macOS **Space** that holds the
+window that fired it, raise *that* window (you may have several WezTerm windows
+spread across Spaces), and select the tab. The shipped solution lets **WezTerm
+focus its own window** — but only after ruling out the obvious approaches, which
+were all verified dead on this build (20240203):
+
+- **`wezterm cli activate-pane` / `activate-tab` are Mux-level only.** Verified
+  live: activating a pane in a window on another Space left `list-clients`
+  `focused_pane_id` unchanged and did not switch Space (WezTerm issue #3542). They
+  *do* select the tab within the Mux, which is still useful (see below).
+- **No `wezterm cli` command raises a GUI window** (`activate-window`, #3542, is
+  unimplemented), and **`set-window-title` is a no-op on macOS** here (#4899).
+- **AppleScript `AXRaise` can't reach an off-Space window.** System Events only
+  enumerates windows on the *current* Space; a window on another Space has an
+  **empty AXTitle** and isn't selectable, so `first window whose name contains …`
+  returns nothing (`-1719`). `AXRaise` also can't switch Spaces by itself (that
+  lives in Dock.app/SkyLight). So "activate the app, then AXRaise the target by a
+  title tag" only works when the target already happens to be on the Space the
+  app-activation landed on — exactly the multi-window case we need to solve. Dead
+  end (an earlier version of this project shipped it; live testing showed it
+  fails for the real scenario).
+
+**What works: WezTerm's own `window:focus()`, triggered via `user-var-changed`.**
+An app focusing *its own* window makes macOS follow to that window's Space — no
+Accessibility needed. We just need to get a shell click to call Lua, and the
+bridge is the one we already use for tab color: writing an OSC 1337 SetUserVar to
+the pane's tty. So the click's `-execute` is:
+
+```sh
+/usr/bin/open -a WezTerm \
+; <wezterm> cli activate-pane --pane-id N >/dev/null 2>&1 \
+; /bin/sleep 0.25 \
+; printf '\033]1337;SetUserVar=CLAUDE_FOCUS_REQUEST=MQ==\007' > <tty>
+```
+
+and `claude-notify.lua` handles it:
+
+```lua
+wezterm.on('user-var-changed', function(window, pane, name, value)
+  if name == 'CLAUDE_FOCUS_REQUEST' then
+    pcall(function() pane:activate() end)   -- select the originating tab
+    pcall(function() window:focus() end)    -- raise window + switch Space
+  end
+end)
+```
+
+Why each piece, and the traps (all verified live on 20240203):
+
+1. **`open -a WezTerm` is required for the cross-*app* case.** When you click a
+   toast you're usually in another app. `window:focus()` updates WezTerm's focused
+   window but does **not** pull WezTerm in front of another app on its own
+   (verified: from Finder, the var-write moved `focused_pane_id` but left Finder
+   frontmost). `open -a WezTerm` foregrounds WezTerm; then `window:focus()` does
+   the within-WezTerm cross-Space move.
+
+2. **The `sleep` matters.** `window:focus()` only switches Space when WezTerm is
+   already frontmost. The 0.25 s lets `open -a` win the foreground before the var
+   write fires `user-var-changed`. Too short and you can land on the wrong Space.
+
+3. **`user-var-changed` fires on *every* SetUserVar receipt — even an unchanged
+   value** (verified: writing `MQ==` twice fired twice). So the value is arbitrary
+   (`MQ==` = base64 "1"); a constant re-fires on every click. No per-click nonce
+   needed.
+
+4. **`pane:activate()` selects the originating tab** even when it isn't the
+   window's active tab (verified: triggering on a background pane switched the
+   window's active tab to it). `window:focus()` then raises the window and follows
+   to its Space.
+
+5. **Graceful degradation.** On a build where `user-var-changed` doesn't fire, the
+   var write is simply a no-op and the preceding `open -a` + `activate-pane` still
+   foreground WezTerm and select the tab — the old behavior. `WCN_FOCUS=0` forces
+   that path explicitly.
+
+6. **No Accessibility permission, no window-title tag.** Because WezTerm moves its
+   own window, we avoid both the TCC grant and polluting window titles with a
+   lookup tag — the two costs of the AXRaise dead end above.
+
+The one remaining dependency is the macOS Dock setting **"When switching to an
+application, switch to a Space with open windows for the application"**
+(`workspaces-auto-swoosh`, **on** by default). With it off, `window:focus()` can
+still update focus but macOS won't follow to the Space, and no supported API can
+force it (only private, SIP-gated SkyLight/CGS calls — rejected).
 
 ## The tab number is a position, not an id
 
@@ -131,8 +220,17 @@ ranking the pane's `tab_id` among the window's tab ids. The click action uses
 The pipeline is observable without guessing:
 
 - `wezterm cli list --format json` shows each pane's `tty_name`, `title`,
-  `window_id`, `tab_id`, `is_active`.
+  `window_id`, `tab_id`, `is_active`. `wezterm cli list-clients --format json`
+  shows the GUI's live `focused_pane_id` — the signal for whether a focus request
+  actually moved the GUI (the Mux `is_active` does not reflect GUI focus).
 - To confirm a SetUserVar actually lands, temporarily log from `format-tab-title`
   (`io.open('/tmp/x.log','a')`) the value of `tab.active_pane.user_vars.CLAUDE_STATUS`.
 - `terminal-notifier -list ALL` shows whether a toast was *delivered* (vs. just
   not displayed because permission is off).
+- To test click-to-focus without clicking: find the target pane's tty
+  (`wezterm cli list`), then `printf '\033]1337;SetUserVar=CLAUDE_FOCUS_REQUEST=MQ==\007' > /dev/ttysNNN`.
+  Watch `focused_pane_id` move to that pane. To exercise the full cross-app path,
+  `open -a` another app first, then run the click's exact `-execute` string via
+  `/bin/sh -c`. Note: macOS Space/window state is genuinely flaky to observe while
+  you're actively switching Spaces — read `focused_pane_id` as the ground truth,
+  and judge the user-facing result by clicking a real toast.

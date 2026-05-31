@@ -19,6 +19,9 @@
 # Config via env (all optional):
 #   WCN_TOAST=0          disable OS toasts (tab coloring still works)
 #   WCN_NOTIFIER=/path   force a specific terminal-notifier binary
+#   WCN_FOCUS=0          on click, only foreground WezTerm + select the tab; skip
+#                        the user-var write that switches macOS Space / raises the
+#                        originating window (use on builds without user-var-changed)
 
 set -u
 status="${1:-}"
@@ -99,12 +102,34 @@ if [ -n "$fallback_msg" ]; then
   [ -z "$tn" ] && { for c in /opt/homebrew/bin/terminal-notifier /usr/local/bin/terminal-notifier; do [ -x "$c" ] && tn="$c" && break; done; }
 
   if [ -n "${tn:-}" ] && [ -x "$tn" ]; then
-    # Clicking runs: focus this pane (switches to its tab) + bring WezTerm to front.
-    # Absolute paths because the click command runs with a minimal PATH.
+    # What a click does, in order (runs under /bin/sh with a minimal PATH, so
+    # absolute paths). The goal: jump to the originating window's macOS Space,
+    # raise that window, and select its tab — even with several WezTerm windows
+    # spread across Spaces.
+    #   1. open -a WezTerm — foreground WezTerm over whatever app you're in (a
+    #      backgrounded app can't pull itself forward from Lua alone).
+    #   2. activate-pane  — Mux-level tab select; this is ALSO the graceful
+    #      degradation path on older builds where user-var-changed doesn't fire.
+    #   3. sleep, then write CLAUDE_FOCUS_REQUEST to THIS pane's tty. WezTerm
+    #      fires user-var-changed and claude-notify.lua calls pane:activate() +
+    #      window:focus(): selects the tab, raises the OS window, and (an app
+    #      focusing its own window makes macOS follow) switches to that window's
+    #      Space. The short sleep lets step 1 bring WezTerm frontmost first —
+    #      window:focus() only switches Space when WezTerm is already frontmost.
+    # NO macOS Accessibility permission and NO window-title tag are needed.
+    # The SetUserVar VALUE is arbitrary (MQ== = base64 "1"): WezTerm fires the
+    # event on every SetUserVar receipt, so a constant re-fires on every click.
+    # WCN_FOCUS=0 keeps only foreground + tab select (no Space/window jump).
+    # CLAUDE_FOCUS_REQUEST must match the name claude-notify.lua listens for.
+    if [ "${WCN_FOCUS:-1}" != "0" ]; then
+      exec_cmd="/usr/bin/open -a WezTerm ; ${wezterm} cli activate-pane --pane-id ${WEZTERM_PANE} >/dev/null 2>&1 ; /bin/sleep 0.25 ; printf '\033]1337;SetUserVar=CLAUDE_FOCUS_REQUEST=MQ==\007' > ${tty_dev}"
+    else
+      exec_cmd="${wezterm} cli activate-pane --pane-id ${WEZTERM_PANE} ; /usr/bin/open -a WezTerm"
+    fi
     args=( -title "Claude needs input: ${dir}"
            -message "$body"
            -group "wezterm-claude-${WEZTERM_PANE}"
-           -execute "${wezterm} cli activate-pane --pane-id ${WEZTERM_PANE} ; /usr/bin/open -a WezTerm" )
+           -execute "$exec_cmd" )
     [ -n "$icon" ] && args+=( -appIcon "$icon" )
     "$tn" "${args[@]}" >/dev/null 2>&1
   else

@@ -21,7 +21,9 @@ macOS notification that jumps straight to the right tab.
 An alert **auto-clears once you focus that tab** (you've seen it), so colors
 don't pile up. Notifications say *which* project and tab — e.g.
 **"Claude needs input: web-ui — ✳ Refactor auth (⌘2)"** — and clicking one
-brings WezTerm forward and switches to that exact tab.
+**jumps to the macOS Space holding that window**, raises that exact window, and
+selects that tab — even with several WezTerm windows spread across Spaces. No
+extra macOS permission required.
 
 ## Requirements
 
@@ -59,11 +61,17 @@ claude.apply(config)   -- place before `return config`
 
 **Two manual steps the installer can't do for you:**
 
-- The first time a toast fires, macOS needs you to allow it:
-  **System Settings → Notifications → terminal-notifier → Allow Notifications.**
-- Reload config — Claude Code hot-reloads `settings.json`, WezTerm auto-reloads
-  `wezterm.lua`. A fresh WezTerm tab is cleanest. Run `/hooks` in Claude Code to
-  confirm the three hooks are registered.
+1. The first time a toast fires, macOS needs you to allow it:
+   **System Settings → Notifications → terminal-notifier → Allow Notifications.**
+2. Reload config — Claude Code hot-reloads `settings.json`, WezTerm auto-reloads
+   `wezterm.lua`. A fresh WezTerm tab is cleanest. Run `/hooks` in Claude Code to
+   confirm the three hooks are registered.
+
+That's it — **no Accessibility permission is needed**. Click-to-Space works by
+having WezTerm focus its own window (which makes macOS follow to that window's
+Space); see [How it works](#how-it-works-short-version). For this, macOS's
+*"When switching to an application, switch to a Space with open windows"*
+(Desktop & Dock → Mission Control) must stay **on** — it is on by default.
 
 ## Configuration
 
@@ -76,6 +84,9 @@ claude.apply(config, {
     done      = { bg = '#98c379', fg = '#1e1e2e' },  -- green
   },
   prefix = { attention = '⚠️ ', done = '✅ ' },
+  click_to_focus = true,  -- handle CLAUDE_FOCUS_REQUEST so a toast click jumps to
+                          -- the originating window's Space + tab (set false to
+                          -- opt out of registering the user-var-changed handler)
 })
 ```
 
@@ -94,21 +105,42 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max)
 end)
 ```
 
+**Already have your own `user-var-changed` handler?** Set `click_to_focus = false`
+so `apply()` doesn't register a second one, and call the module's handler from
+yours:
+
+```lua
+wezterm.on('user-var-changed', function(window, pane, name, value)
+  claude.on_user_var(window, pane, name, value)  -- acts only on CLAUDE_FOCUS_REQUEST
+  -- ...your own var handling here...
+end)
+```
+
 Helper env vars: `WCN_TOAST=0` disables toasts (tab coloring still works);
-`WCN_NOTIFIER=/path/to/terminal-notifier` forces a specific binary.
+`WCN_NOTIFIER=/path/to/terminal-notifier` forces a specific binary;
+`WCN_FOCUS=0` makes a click only foreground WezTerm + select the tab, skipping
+the Space/window jump (for older WezTerm without the `user-var-changed` event).
 
 ## How it works (short version)
 
 Claude Code hooks fire `wezterm-claude-notify.sh`, which sets a per-pane WezTerm
 user var `CLAUDE_STATUS` (via an OSC 1337 *SetUserVar* escape sequence written
-**directly to the pane's tty device**) and posts a `terminal-notifier` toast
-whose click action runs `wezterm cli activate-pane`. The Lua module reads
-`CLAUDE_STATUS` in `format-tab-title` and tints the tab.
+**directly to the pane's tty device**) and posts a `terminal-notifier` toast.
+The Lua module reads `CLAUDE_STATUS` in `format-tab-title` and tints the tab.
+
+The toast's click action foregrounds WezTerm (`open -a WezTerm`) and then writes
+a second user var, `CLAUDE_FOCUS_REQUEST`, to the originating pane's tty. WezTerm
+fires its `user-var-changed` event, and the Lua module responds with
+`pane:activate()` + `window:focus()`: this selects the originating tab, raises
+its OS window, and — because an app focusing its own window makes macOS follow —
+**switches to that window's Space**. WezTerm does the cross-Space move itself, so
+no Accessibility permission is needed.
 
 It's less obvious than it sounds — Claude Code hooks have no controlling
-terminal, WezTerm requires the user-var value to be base64-encoded, and OSC
-notifications can't carry a click target. See [docs/DESIGN.md](docs/DESIGN.md)
-for the full rationale and the dead-ends to avoid.
+terminal, WezTerm requires the user-var value to be base64-encoded, OSC
+notifications can't carry a click target, and `wezterm cli` can neither raise a
+GUI window nor switch Spaces. See [docs/DESIGN.md](docs/DESIGN.md) for the full
+rationale and the dead-ends to avoid.
 
 ## Troubleshooting
 
@@ -120,10 +152,17 @@ for the full rationale and the dead-ends to avoid.
   Settings → Notifications.
 - **Wrong tab number in the toast:** the number is the 1-based *position*
   (what `⌘N` reaches), computed per window.
-- **Multiple windows:** clicking reliably switches the tab and foregrounds the
-  app; raising a *specific background window* across several windows needs an
-  extra AppleScript step (not included — most setups run sessions as tabs in one
-  window). Open an issue if you need it.
+- **Click foregrounds WezTerm but doesn't switch Space / select the tab:** make
+  sure `claude.apply(config)` is loaded (it registers the `user-var-changed`
+  handler) and `click_to_focus` isn't `false`; if you have your own
+  `user-var-changed` handler, call `claude.on_user_var(...)` from it (see
+  [Configuration](#configuration)). On very old WezTerm builds without the
+  `user-var-changed` event, set `WCN_FOCUS=0` for the foreground + tab-select
+  fallback.
+- **Click doesn't switch Space at all:** macOS's *"When switching to an
+  application, switch to a Space with open windows for the application"* must stay
+  **on** (Desktop & Dock → Mission Control; it's the default). No supported API
+  can switch Spaces if it's off.
 
 ## Uninstall
 

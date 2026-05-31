@@ -1,9 +1,17 @@
--- wezterm-claude-notify — color WezTerm tabs by Claude Code session state.
+-- wezterm-claude-notify — color WezTerm tabs by Claude Code session state, and
+-- make a clicked notification jump to the originating window's macOS Space + tab.
 --
 -- A companion script (bin/wezterm-status.sh), driven by Claude Code hooks, sets
 -- a per-pane user var CLAUDE_STATUS to "ATTENTION", "DONE" or "" via an OSC 1337
 -- SetUserVar escape sequence. This module reads that var in format-tab-title and
 -- tints the tab. An alert auto-clears once you focus the tab (you've seen it).
+--
+-- CLICK-TO-FOCUS: when you click an attention toast, the helper writes another
+-- user var (CLAUDE_FOCUS_REQUEST) to the originating pane's tty. This module
+-- handles the `user-var-changed` event and calls pane:activate() + window:focus()
+-- — which selects the originating tab, raises its OS window, and (because an app
+-- focusing its own window makes macOS follow) switches to that window's macOS
+-- Space. No Accessibility permission and no window-title tag required.
 --
 -- USAGE (most setups — no existing format-tab-title):
 --   local claude = require 'claude-notify'
@@ -18,10 +26,15 @@
 --     local fg = d and d.fg or '#cccccc'
 --     return { {Background={Color=bg}}, {Foreground={Color=fg}}, {Text=' '..title..' '} }
 --   end)
+--   -- ...and, if you already handle user-var-changed yourself, also call:
+--   wezterm.on('user-var-changed', function(window, pane, name, value)
+--     claude.on_user_var(window, pane, name, value)  -- handles CLAUDE_FOCUS_REQUEST
+--   end)
 --
 -- Options (all optional) for apply()/configure():
 --   colors  = { attention = {bg=..., fg=...}, done = {bg=..., fg=...} }
 --   prefix  = { attention = '⚠️ ', done = '✅ ' }
+--   click_to_focus = true|false  -- handle CLAUDE_FOCUS_REQUEST to jump Space+tab
 --   notification_handling = 'SuppressFromFocusedTab' | 'AlwaysShow' | ...
 --       (only relevant if you fall back to WezTerm's native OSC toasts; the
 --        terminal-notifier path used by default is unaffected by this.)
@@ -29,6 +42,10 @@
 local wezterm = require 'wezterm'
 
 local M = {}
+
+-- The user var the helper writes (base64) when an attention toast is CLICKED.
+-- Must stay in lockstep with bin/wezterm-status.sh, which sets the same name.
+local FOCUS_VAR = 'CLAUDE_FOCUS_REQUEST'
 
 local defaults = {
   colors = {
@@ -40,6 +57,7 @@ local defaults = {
     done      = '✅ DONE - ',
   },
   user_var = 'CLAUDE_STATUS',
+  click_to_focus = true,
 }
 
 local opts = defaults
@@ -63,6 +81,8 @@ function M.configure(o)
       attention = (o.prefix and o.prefix.attention) or defaults.prefix.attention,
       done      = (o.prefix and o.prefix.done)      or defaults.prefix.done,
     },
+    -- explicit nil check so click_to_focus = false is honored (not coerced to true)
+    click_to_focus = (o.click_to_focus == nil) and defaults.click_to_focus or o.click_to_focus,
     notification_handling = o.notification_handling,
   }
   return M
@@ -92,9 +112,20 @@ function M.decorate(tab)
   return nil
 end
 
--- Register a standalone format-tab-title handler. Returns the tab's normal title
--- (with an alert prefix) only when there's an alert to show; otherwise returns
--- nil so WezTerm's default rendering (or another handler) takes over.
+-- Handle a user-var-changed event. When the helper's toast click writes
+-- CLAUDE_FOCUS_REQUEST to a pane's tty, select that pane's tab and focus its
+-- window — which raises the OS window and switches to its macOS Space. Every
+-- other user var is ignored. pcall-guarded so a stale pane/window reference
+-- never raises. Safe to call from your own user-var-changed handler.
+function M.on_user_var(window, pane, name, value)
+  if name ~= FOCUS_VAR then return end
+  pcall(function() if pane then pane:activate() end end)      -- select the originating tab
+  pcall(function() if window then window:focus() end end)     -- raise window + switch Space
+end
+
+-- Register standalone format-tab-title (tab tinting) and, unless disabled, a
+-- user-var-changed handler (click-to-focus). format-tab-title returns nil when
+-- there's no alert so WezTerm's default rendering (or another handler) wins.
 function M.apply(config, o)
   if o then M.configure(o) end
   if opts.notification_handling and config and config.notification_handling == nil then
@@ -109,6 +140,9 @@ function M.apply(config, o)
       { Text = ' ' .. d.prefix .. tab.active_pane.title .. ' ' },
     }
   end)
+  if opts.click_to_focus then
+    wezterm.on('user-var-changed', M.on_user_var)
+  end
   return M
 end
 

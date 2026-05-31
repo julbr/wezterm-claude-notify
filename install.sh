@@ -141,4 +141,8 @@ echo "     System Settings → Notifications → terminal-notifier → Allow Not
 echo "  2. Reload config: Claude Code hot-reloads settings.json; WezTerm auto-reloads"
 echo "     wezterm.lua. (A fresh WezTerm tab is the cleanest.)"
 echo
+echo "Click-to-Space needs NO Accessibility permission. It does rely on the macOS"
+echo "default 'switch to a Space with open windows for the application' staying ON"
+echo "(System Settings → Desktop & Dock → Mission Control). Set WCN_FOCUS=0 to opt out."
+echo
 echo "Verify with:  /hooks   (inside Claude Code — should list Notification/Stop/UserPromptSubmit)"
