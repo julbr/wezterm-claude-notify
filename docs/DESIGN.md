@@ -215,6 +215,49 @@ The toast shows `(⌘N)` where N is the **1-based tab position within the window
 ranking the pane's `tab_id` among the window's tab ids. The click action uses
 `--pane-id` (precise), while the displayed number uses position (human-friendly).
 
+## Folder-aware tab titles
+
+Two related needs, one mechanism. A tab sitting at a bare shell has no useful
+pane title (it's empty, or just the shell's process name like `zsh`); a Claude
+Code tab sets its title to the **task it's working on**, but with several
+sessions open you can't tell which project each belongs to. `format-tab-title`
+(and the public `claude.title(tab)` helper) fill both in from the pane's working
+directory, in this precedence:
+
+1. **explicit tab rename** (`tab.tab_title`, set via the rename UI or
+   `wezterm cli set-tab-title`) → shown as-is; the user asked for it. (An active
+   alert still prepends its prefix and tints the tab — only the *title* is theirs.)
+2. **bare title** (empty, or a known shell name) → the cwd folder name (`wisp`).
+3. **anything else** (a real title) → prefix it with the folder
+   (`[wisp] Add search …`).
+
+With `show_folder = false` the whole title path is skipped: a non-alert tab
+returns `nil` from the handler, so WezTerm renders its default and only the
+alert tinting remains.
+
+We don't try to detect "is this Claude Code". Anything that sets a real pane
+title (Claude, vim, a custom prompt) gets the `[folder]` prefix; a plain shell
+gets the folder as its title. Both are useful, so the simple rule wins. Two
+deliberate choices: we keep a small allow-list of shell process names
+(`zsh`/`bash`/`fish`/…) so a default shell that titles itself `zsh` still shows
+the folder, not `[folder] zsh`; and we don't strip Claude's leading spinner
+glyph before prefixing — it's version-specific and harmless: `[wisp] ⠐ Add …`.
+
+The folder comes from `PaneInformation.current_working_dir`, which WezTerm
+populates from **OSC 7** (your shell — and Claude Code — emit it). Two
+cross-build traps the helper absorbs:
+
+- **It changed type.** Before 20240127 it was a `file://` **string**; since
+  20240127 it's a **Url object** (read `.file_path`). `folder_name()` handles
+  both, plus a `tostring()` + string-parse fallback for a non-`file` scheme or a
+  build where `.file_path` is unavailable.
+- **It can be nil.** A shell that doesn't emit OSC 7 reports no cwd; then there's
+  no folder and the title falls back to the pane title (or WezTerm's default).
+
+The non-alert path returns the title as a **plain string**, not a colored
+`{Background=…}` list, so a normal tab keeps your theme's active/inactive tab
+colors — only an actual alert overrides them.
+
 ## Verifying changes
 
 The pipeline is observable without guessing:
