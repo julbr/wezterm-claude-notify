@@ -22,6 +22,12 @@ working-directory name instead of `zsh` or a blank.
 | finished its turn (`Stop`)                        | 🟢 green "DONE"          | no |
 | you send a new prompt (`UserPromptSubmit`)        | normal (cleared)         | no |
 
+> The `Notification` row covers genuine input/permission prompts only. Claude
+> Code's *non-input* notifications — idle *"waiting for your next prompt"* (which
+> fires on any quiet session ~60 s after it goes idle, including a fresh
+> `/clear`), auth success, and completed MCP forms — are filtered out by
+> `notification_type`, so an idle tab never turns red on its own.
+
 An alert **auto-clears once you focus that tab** (you've seen it), so colors
 don't pile up. Notifications say *which* project and tab — e.g.
 **"Claude needs input: web-ui — ✳ Refactor auth (⌘2)"** — and clicking one

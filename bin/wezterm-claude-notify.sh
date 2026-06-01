@@ -3,7 +3,10 @@
 #
 # Called by Claude Code hooks with a status and (for alerts) a message:
 #   wezterm-claude-notify.sh <ATTENTION|DONE|WORKING> [toast message]
-#     ATTENTION -> red tab  + clickable OS toast
+#     ATTENTION -> red tab  + clickable OS toast  (but Claude Code's non-input
+#                  Notifications — idle "waiting for your next prompt", auth
+#                  success, completed MCP forms — are filtered out; see the
+#                  notification_type guard below)
 #     DONE      -> green tab
 #     WORKING   -> clears the highlight (tab back to normal)
 #
@@ -30,6 +33,23 @@ fallback_msg="${2:-}"
 # Only meaningful inside WezTerm.
 [ -n "${WEZTERM_PANE:-}" ] || exit 0
 
+# Claude Code delivers the hook's JSON event on stdin. For the Notification hook
+# (status ATTENTION) we read it so we can tell a real input/permission request
+# from a non-input Notification (idle "waiting for your next prompt", auth
+# success, …) that must NOT turn the tab red. The read is BOUNDED on purpose:
+# `read -t 1` caps it at one second so a caller that delivers the event but holds
+# stdin open can never hang the hook — Claude Code closes stdin right after the
+# event, so the normal path still returns instantly; `-d ''` slurps the whole
+# payload (incl. a pretty-printed multi-line one). Read only for ATTENTION (the
+# DONE/WORKING paths never touch stdin), and skip it on an interactive terminal,
+# which carries no payload to wait for. On timeout or no payload, hook_payload is
+# empty and we fall through to alerting (fail visible). `|| true`: a no-delimiter
+# EOF/timeout makes read exit non-zero, which is expected, not an error.
+hook_payload=""
+if [ "$status" = "ATTENTION" ] && [ ! -t 0 ]; then
+  IFS= read -r -d '' -t 1 hook_payload || true
+fi
+
 # --- locate tools (portable across Homebrew prefixes / install locations) ----
 find_wezterm() {
   if [ -n "${WEZTERM_EXECUTABLE_DIR:-}" ] && [ -x "${WEZTERM_EXECUTABLE_DIR}/wezterm" ]; then
@@ -47,6 +67,30 @@ wezterm="$(find_wezterm)" || exit 0
 PYTHON="$(command -v python3 2>/dev/null || true)"
 [ -z "$PYTHON" ] && PYTHON=/usr/bin/python3
 [ -x "$PYTHON" ] || exit 0
+
+# Drop the non-input Notification types: these don't need you, so they must not
+# paint the tab red. The set is Claude Code's known informational events —
+#   idle_prompt           Claude is idle, "waiting for your next prompt"
+#   auth_success          a login / auth just succeeded
+#   elicitation_complete  an MCP elicitation form was submitted or dismissed
+#   elicitation_response  an MCP elicitation response was sent back
+# Everything ELSE still flags the tab: the genuine input requests
+# (permission_prompt, elicitation_dialog) AND — deliberately — any unknown or
+# future type, an empty/unparseable payload, or a Claude Code too old to carry
+# notification_type. That's a denyLIST, not an allowlist, so it's fail VISIBLE:
+# we never silently swallow a real prompt; the cost of an unknown type is at most
+# one spurious red tab. Bailing here also skips the wezterm query below.
+if [ -n "$hook_payload" ]; then
+  ntype="$(printf '%s' "$hook_payload" | "$PYTHON" -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get("notification_type", "") if isinstance(d, dict) else "")
+except Exception:
+    print("")' 2>/dev/null)"
+  case "$ntype" in
+    idle_prompt|auth_success|elicitation_complete|elicitation_response) exit 0 ;;
+  esac
+fi
 
 # WezTerm app icon (for the toast), derived from the binary location.
 icon=""

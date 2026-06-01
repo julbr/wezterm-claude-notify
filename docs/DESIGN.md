@@ -77,6 +77,41 @@ It is tempting to look for a CLI that sets a user var directly. There isn't one
 either. The only way to set a user var is to emit the OSC 1337 sequence
 yourself. That's why the helper writes to the tty device.
 
+## Trap 5 — Not every `Notification` means "needs you"
+
+Claude Code's `Notification` hook fires for six `notification_type`s, and most
+don't need you: `idle_prompt` (Claude has gone quiet — "waiting for your next
+prompt"), `auth_success` (a login succeeded), and `elicitation_complete` /
+`elicitation_response` (an MCP form was already answered). `idle_prompt` is the
+worst offender — it fires on *any* session ~60 s after it goes idle, **including
+one you just `/clear`ed and walked away from** — so mapping every Notification to
+`ATTENTION` paints an idle, empty tab red "REQUIRES INPUT" with nothing actually
+needing you (and flips a finished green tab back to red a minute after `Stop`).
+Only `permission_prompt` and `elicitation_dialog` are genuine input requests.
+
+The fix is data-driven, not matcher-driven: the helper reads the hook's JSON
+event from **stdin** (Claude Code delivers it there), extracts
+`notification_type`, and bails on the known non-input set above. Three things
+keep this from misfiring:
+
+- stdin is read **only** for the `ATTENTION` invocation (the `Stop`/`UserPromptSubmit`
+  paths never touch it), with a **bounded** `read -r -d '' -t 1` rather than an
+  unbounded `cat`: Claude Code closes stdin right after the event so the read
+  returns at once, but the 1 s cap means a caller that delivers the event yet
+  *holds stdin open* can never hang the hook. (We also skip the read on an
+  interactive tty, which carries no payload to wait for.)
+- a deny**list**, not an allowlist: an empty/unparseable payload, a Claude Code
+  too old to carry `notification_type`, or any *unknown/future* type all fall
+  through to the alert — *fail visible*, never silently swallow a real prompt.
+  The cost of a miss is at most one spurious red tab, never a missed one — which
+  is why we list what to *drop*, not what to *keep*.
+- the bail happens before the `wezterm cli list` query, so a suppressed ping
+  costs almost nothing.
+
+We filter in the script rather than narrowing the hook `matcher` so the policy
+lives in one place, survives any future notification_type, and degrades safely
+on builds that don't populate the field.
+
 ## Why the tab clears on focus (and why it's done in Lua)
 
 The complaint with a naive version: a tab flags red and **stays** red. The only
