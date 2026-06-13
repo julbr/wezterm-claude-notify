@@ -46,6 +46,7 @@ fallback_msg="${2:-}"
 # empty and we fall through to alerting (fail visible). `|| true`: a no-delimiter
 # EOF/timeout makes read exit non-zero, which is expected, not an error.
 hook_payload=""
+hook_cwd=""
 if [ "$status" = "ATTENTION" ] && [ ! -t 0 ]; then
   IFS= read -r -d '' -t 1 hook_payload || true
 fi
@@ -81,12 +82,18 @@ PYTHON="$(command -v python3 2>/dev/null || true)"
 # we never silently swallow a real prompt; the cost of an unknown type is at most
 # one spurious red tab. Bailing here also skips the wezterm query below.
 if [ -n "$hook_payload" ]; then
-  ntype="$(printf '%s' "$hook_payload" | "$PYTHON" -c 'import json,sys
+  # One parse yields both the notification_type (for the denylist below) and the
+  # FIRING session's own cwd (for the stale-pane guard further down). Tab-delimited;
+  # cwd can't contain a tab, and a parse failure yields a lone tab (both empty).
+  parsed="$(printf '%s' "$hook_payload" | "$PYTHON" -c 'import json,sys
 try:
     d = json.load(sys.stdin)
-    print(d.get("notification_type", "") if isinstance(d, dict) else "")
+    d = d if isinstance(d, dict) else {}
+    sys.stdout.write((d.get("notification_type") or "") + "\t" + (d.get("cwd") or ""))
 except Exception:
-    print("")' 2>/dev/null)"
+    sys.stdout.write("\t")' 2>/dev/null)"
+  ntype="${parsed%%$'\t'*}"
+  hook_cwd="${parsed#*$'\t'}"
   case "$ntype" in
     idle_prompt|auth_success|elicitation_complete|elicitation_response) exit 0 ;;
   esac
@@ -107,7 +114,7 @@ esac
 # window by ranking this pane's tab among the window's tabs.
 info="$(
   "$wezterm" cli list --format json 2>/dev/null \
-  | "$PYTHON" -c 'import json,sys,os
+  | "$PYTHON" -c 'import json,sys,os,urllib.parse
 pid=int(os.environ.get("WEZTERM_PANE","-1"))
 data=json.load(sys.stdin)
 p=next((x for x in data if x.get("pane_id")==pid), {})
@@ -115,7 +122,13 @@ win=p.get("window_id"); mytab=p.get("tab_id")
 tabs=sorted({x.get("tab_id") for x in data if x.get("window_id")==win and x.get("tab_id") is not None})
 pos=(tabs.index(mytab)+1) if mytab in tabs else ""
 def clean(s): return (s or "").replace("\t"," ").replace("\n"," ").replace(";",",").strip()
-print("\t".join([clean(p.get("tty_name")), clean(p.get("title")), clean(p.get("cwd")), str(pos)]))' 2>/dev/null
+# WezTerm reports cwd as a file://host/path URL; reduce it to a plain, percent-
+# decoded filesystem path so it matches the hook payload cwd (a plain path) when
+# the stale-pane guard compares them. (The basename for dir still works on either.)
+def to_path(u):
+    u = u or ""
+    return urllib.parse.unquote(urllib.parse.urlparse(u).path or "") if "://" in u else u
+print("\t".join([clean(p.get("tty_name")), clean(p.get("title")), clean(to_path(p.get("cwd"))), str(pos)]))' 2>/dev/null
 )"
 IFS=$'\t' read -r tty_dev pane_title pane_cwd tab_pos <<< "${info:-}"
 
@@ -125,6 +138,28 @@ if [ -z "${tty_dev:-}" ]; then
   [ -n "$t" ] && [ "$t" != "??" ] && tty_dev="/dev/$t"
 fi
 [ -n "${tty_dev:-}" ] && [ -w "$tty_dev" ] || exit 0
+
+# --- guard: a stale/inherited WEZTERM_PANE (background & agent sessions) ------
+# $WEZTERM_PANE identifies the firing session's pane ONLY for a plain one-Claude-
+# per-pane session. A daemon-managed, backgrounded, or `claude agents`-orchestrated
+# session inherits the WEZTERM_PANE of whatever pane LAUNCHED it, which may now hold
+# an unrelated (or dormant) session. We'd then resolve THAT pane and stamp its folder
+# + title onto — and paint its tab for — a notification that came from elsewhere
+# (e.g. a loc-inspections agent surfacing as "landmark"). The Notification payload
+# carries the firing session's OWN cwd: if its project root differs from the resolved
+# pane's, the pane isn't ours, so suppress (no toast, no tab paint). Worktrees live at
+# <project>/.claude/worktrees/<name>, so normalize both to the project root first.
+# Skipped when either cwd is unknown (empty payload, older Claude, lookup miss) so the
+# normal foreground path is untouched — fail visible, never swallow a real prompt.
+project_root() {  # owning project root: drop a trailing slash + any Claude worktree suffix
+  local p="${1%/}"
+  case "$p" in */.claude/worktrees/*) p="${p%%/.claude/worktrees/*}" ;; esac
+  printf '%s' "$p"
+}
+if [ -n "${hook_cwd:-}" ] && [ -n "${pane_cwd:-}" ] \
+   && [ "$(project_root "$hook_cwd")" != "$(project_root "$pane_cwd")" ]; then
+  exit 0
+fi
 
 # --- tab color: OSC 1337 SetUserVar (value MUST be base64-encoded) -----------
 case "$status" in

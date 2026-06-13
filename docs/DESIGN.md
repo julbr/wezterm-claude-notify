@@ -112,6 +112,56 @@ We filter in the script rather than narrowing the hook `matcher` so the policy
 lives in one place, survives any future notification_type, and degrades safely
 on builds that don't populate the field.
 
+## Trap 6 — A background / agent session's `$WEZTERM_PANE` is stale
+
+The whole pipeline assumes `$WEZTERM_PANE` names *this* session's own pane. That
+holds for a plain one-Claude-per-pane session, but **not** for a session the
+Claude *daemon* runs detached, a backgrounded (`bg`) task, or a sub-session the
+`claude agents` orchestrator spawns. Those processes inherit the `WEZTERM_PANE`
+of whatever pane *launched their lineage*, captured once and frozen — even though
+they have no controlling terminal of their own and that pane may now hold a
+completely unrelated (or long-dormant) session.
+
+The symptom (observed live): a **loc-inspections** agent session, whose payload
+`cwd` was `…/loc-inspections/.claude/worktrees/lifecycle-overhaul-plan` and which
+carried an `agent_type` field, fired with `WEZTERM_PANE=4` — a **landmark** pane.
+The helper dutifully resolved pane 4 and produced
+`Claude needs input: landmark — Local and deployed testing instructions (⌘1)`,
+i.e. that pane's folder, that pane's title, that pane's tab number, for a
+notification that came from loc-inspections. Of 59 toasts in one afternoon, 58
+were pinned to just two launcher panes this way. `idle_prompt` re-fires hid most
+of it (they're dropped by Trap 5), but `permission_prompt` / `elicitation_dialog`
+toasts surfaced the lie. WezTerm CANNOT help here: a detached session simply isn't
+in any pane, so there is no "correct" pane to point at.
+
+**The fix is data-driven, using the one truth the hook *does* have about the
+firing session: its `cwd`.** The Notification payload carries the firing session's
+own working directory (verified: it's present alongside `notification_type`,
+`session_id`, `agent_type`). If that cwd's **project root** differs from the
+resolved pane's project root, `$WEZTERM_PANE` is stale — the pane isn't ours — so
+we suppress entirely (no toast, and no OSC paint of someone else's tab). Two
+details keep it from misfiring:
+
+- **Worktrees are normalized first.** A Claude worktree lives at
+  `<project>/.claude/worktrees/<name>`, so its cwd basename
+  (`lifecycle-overhaul-plan`) is *not* the project. We strip the
+  `/.claude/worktrees/*` suffix on **both** sides before comparing, so a
+  loc-inspections worktree agent firing into a loc-inspections pane still matches
+  (and still notifies) — only a genuine *cross-project* mismatch is suppressed.
+- **It degrades to fail-visible.** When either cwd is empty (an empty/old payload,
+  or a `wezterm cli list` miss) we don't compare and fall through to alerting,
+  exactly as before. We never suppress a notification we can't *prove* is
+  misattributed — consistent with the Trap 5 denylist philosophy.
+
+Scope: the guard lives on the `ATTENTION` path (the only one that reads the
+payload), which is what carries the toast and the red paint — the actual
+complaint. A detached session's later `UserPromptSubmit→WORKING` / `Stop→DONE`
+can still briefly clear/green the launcher pane's tab (those paths don't read
+stdin, by Trap 5's design); extending the same cwd guard to them is a tractable
+follow-up if that flicker proves annoying. No documented hook field marks a
+session as background/agent, so the cwd comparison — not a "is this a bg session"
+test — is the reliable signal.
+
 ## Why the tab clears on focus (and why it's done in Lua)
 
 The complaint with a naive version: a tab flags red and **stays** red. The only
