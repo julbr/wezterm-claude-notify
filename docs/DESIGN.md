@@ -77,6 +77,98 @@ It is tempting to look for a CLI that sets a user var directly. There isn't one
 either. The only way to set a user var is to emit the OSC 1337 sequence
 yourself. That's why the helper writes to the tty device.
 
+## Trap 5 — Not every `Notification` means "needs you"
+
+Claude Code's `Notification` hook fires for six `notification_type`s, and most
+don't need you: `idle_prompt` (Claude has gone quiet — "waiting for your next
+prompt"), `auth_success` (a login succeeded), and `elicitation_complete` /
+`elicitation_response` (an MCP form was already answered). `idle_prompt` is the
+worst offender — it fires on *any* session ~60 s after it goes idle, **including
+one you just `/clear`ed and walked away from** — so mapping every Notification to
+`ATTENTION` paints an idle, empty tab red "REQUIRES INPUT" with nothing actually
+needing you (and flips a finished green tab back to red a minute after `Stop`).
+Only `permission_prompt` and `elicitation_dialog` are genuine input requests.
+
+The fix is data-driven, not matcher-driven: the helper reads the hook's JSON
+event from **stdin** (Claude Code delivers it there), extracts
+`notification_type`, and bails on the known non-input set above. Three things
+keep this from misfiring:
+
+- stdin is read with a **bounded** `read -r -d '' -t 1` rather than an unbounded
+  `cat`: Claude Code closes stdin right after the event so the read returns at once,
+  but the 1 s cap means a caller that delivers the event yet *holds stdin open* can
+  never hang the hook. (We also skip the read on an interactive tty, which carries no
+  payload to wait for.) We read it for **every** status — `notification_type` only
+  rides the `ATTENTION` event, but the firing session's `cwd` rides all of them and
+  the stale-pane guard (Trap 6) needs it on `WORKING`/`DONE` too. `Stop` /
+  `UserPromptSubmit` carry no `notification_type`, so the denylist below is simply
+  inert for them.
+- a deny**list**, not an allowlist: an empty/unparseable payload, a Claude Code
+  too old to carry `notification_type`, or any *unknown/future* type all fall
+  through to the alert — *fail visible*, never silently swallow a real prompt.
+  The cost of a miss is at most one spurious red tab, never a missed one — which
+  is why we list what to *drop*, not what to *keep*.
+- the bail happens before the `wezterm cli list` query, so a suppressed ping
+  costs almost nothing.
+
+We filter in the script rather than narrowing the hook `matcher` so the policy
+lives in one place, survives any future notification_type, and degrades safely
+on builds that don't populate the field.
+
+## Trap 6 — A background / agent session's `$WEZTERM_PANE` is stale
+
+The whole pipeline assumes `$WEZTERM_PANE` names *this* session's own pane. That
+holds for a plain one-Claude-per-pane session, but **not** for a session the
+Claude *daemon* runs detached, a backgrounded (`bg`) task, or a sub-session the
+`claude agents` orchestrator spawns. Those processes inherit the `WEZTERM_PANE`
+of whatever pane *launched their lineage*, captured once and frozen — even though
+they have no controlling terminal of their own and that pane may now hold a
+completely unrelated (or long-dormant) session.
+
+The symptom (observed live): a **loc-inspections** agent session, whose payload
+`cwd` was `…/loc-inspections/.claude/worktrees/lifecycle-overhaul-plan` and which
+carried an `agent_type` field, fired with `WEZTERM_PANE=4` — a **landmark** pane.
+The helper dutifully resolved pane 4 and produced
+`Claude needs input: landmark — Local and deployed testing instructions (⌘1)`,
+i.e. that pane's folder, that pane's title, that pane's tab number, for a
+notification that came from loc-inspections. Of 59 toasts in one afternoon, 58
+were pinned to just two launcher panes this way. `idle_prompt` re-fires hid most
+of it (they're dropped by Trap 5), but `permission_prompt` / `elicitation_dialog`
+toasts surfaced the lie. WezTerm CANNOT help here: a detached session simply isn't
+in any pane, so there is no "correct" pane to point at.
+
+**The fix is data-driven, using the one truth the hook *does* have about the
+firing session: its `cwd`.** The Notification payload carries the firing session's
+own working directory (verified: it's present alongside `notification_type`,
+`session_id`, `agent_type`). If that cwd's **project root** differs from the
+resolved pane's project root, `$WEZTERM_PANE` is stale — the pane isn't ours — so
+we suppress entirely (no toast, and no OSC paint of someone else's tab). Two
+details keep it from misfiring:
+
+- **Worktrees are normalized first.** A Claude worktree lives at
+  `<project>/.claude/worktrees/<name>`, so its cwd basename
+  (`lifecycle-overhaul-plan`) is *not* the project. We strip the
+  `/.claude/worktrees/*` suffix on **both** sides before comparing, so a
+  loc-inspections worktree agent firing into a loc-inspections pane still matches
+  (and still notifies) — only a genuine *cross-project* mismatch is suppressed.
+- **It degrades to fail-visible.** When either cwd is empty (an empty/old payload,
+  or a `wezterm cli list` miss) we don't compare and fall through to alerting,
+  exactly as before. We never suppress a notification we can't *prove* is
+  misattributed — consistent with the Trap 5 denylist philosophy.
+
+Scope: the guard sits before the tab-color write, so it covers **all three**
+statuses. `ATTENTION` is the visible complaint (it carries the toast and the red
+paint), but a detached session's later `UserPromptSubmit→WORKING` / `Stop→DONE`
+would otherwise clear/green the launcher pane's tab too; since we now read the
+payload on every status (Trap 5), the same cwd comparison drops those misdirected
+recolors as well. No documented hook field marks a session as background/agent, so
+the cwd comparison — not a "is this a bg session" test — is the reliable signal.
+
+One residual stays by design: a **same-project** background session firing while
+its launcher pane still holds that project has matching roots, so it's *not*
+suppressed (the folder label is correct even if it's a different session). Only
+cross-project misattribution — the actual bug — is dropped.
+
 ## Why the tab clears on focus (and why it's done in Lua)
 
 The complaint with a naive version: a tab flags red and **stays** red. The only
@@ -214,6 +306,49 @@ The toast shows `(⌘N)` where N is the **1-based tab position within the window
 (which diverges from position as tabs are opened/closed). We compute it by
 ranking the pane's `tab_id` among the window's tab ids. The click action uses
 `--pane-id` (precise), while the displayed number uses position (human-friendly).
+
+## Folder-aware tab titles
+
+Two related needs, one mechanism. A tab sitting at a bare shell has no useful
+pane title (it's empty, or just the shell's process name like `zsh`); a Claude
+Code tab sets its title to the **task it's working on**, but with several
+sessions open you can't tell which project each belongs to. `format-tab-title`
+(and the public `claude.title(tab)` helper) fill both in from the pane's working
+directory, in this precedence:
+
+1. **explicit tab rename** (`tab.tab_title`, set via the rename UI or
+   `wezterm cli set-tab-title`) → shown as-is; the user asked for it. (An active
+   alert still prepends its prefix and tints the tab — only the *title* is theirs.)
+2. **bare title** (empty, or a known shell name) → the cwd folder name (`wisp`).
+3. **anything else** (a real title) → prefix it with the folder
+   (`[wisp] Add search …`).
+
+With `show_folder = false` the whole title path is skipped: a non-alert tab
+returns `nil` from the handler, so WezTerm renders its default and only the
+alert tinting remains.
+
+We don't try to detect "is this Claude Code". Anything that sets a real pane
+title (Claude, vim, a custom prompt) gets the `[folder]` prefix; a plain shell
+gets the folder as its title. Both are useful, so the simple rule wins. Two
+deliberate choices: we keep a small allow-list of shell process names
+(`zsh`/`bash`/`fish`/…) so a default shell that titles itself `zsh` still shows
+the folder, not `[folder] zsh`; and we don't strip Claude's leading spinner
+glyph before prefixing — it's version-specific and harmless: `[wisp] ⠐ Add …`.
+
+The folder comes from `PaneInformation.current_working_dir`, which WezTerm
+populates from **OSC 7** (your shell — and Claude Code — emit it). Two
+cross-build traps the helper absorbs:
+
+- **It changed type.** Before 20240127 it was a `file://` **string**; since
+  20240127 it's a **Url object** (read `.file_path`). `folder_name()` handles
+  both, plus a `tostring()` + string-parse fallback for a non-`file` scheme or a
+  build where `.file_path` is unavailable.
+- **It can be nil.** A shell that doesn't emit OSC 7 reports no cwd; then there's
+  no folder and the title falls back to the pane title (or WezTerm's default).
+
+The non-alert path returns the title as a **plain string**, not a colored
+`{Background=…}` list, so a normal tab keeps your theme's active/inactive tab
+colors — only an actual alert overrides them.
 
 ## Verifying changes
 

@@ -6,11 +6,15 @@ state of the Claude Code session running in it, and you get a **clickable**
 macOS notification that jumps straight to the right tab.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  api-server     ⚠️ REQUIRES INPUT - web-ui      ✅ DONE - infra │   ← tab bar
-└──────────────────────────────────────────────────────────────┘
-        ▲ working           ▲ needs you (red)        ▲ finished (green)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  [api] run tests    ⚠️ REQUIRES INPUT - [web] add nav    ✅ DONE - [infra] deploy │  ← tab bar
+└──────────────────────────────────────────────────────────────────────────────┘
+        ▲ working               ▲ needs you (red)            ▲ finished (green)
 ```
+
+Each tab also gets a **folder-aware title**: a Claude Code tab is prefixed with
+the project it runs in — `[api] run tests` — and a plain shell tab shows its
+working-directory name instead of `zsh` or a blank.
 
 | Claude Code event | Tab becomes | Toast? |
 |-------------------|-------------|--------|
@@ -18,12 +22,27 @@ macOS notification that jumps straight to the right tab.
 | finished its turn (`Stop`)                        | 🟢 green "DONE"          | no |
 | you send a new prompt (`UserPromptSubmit`)        | normal (cleared)         | no |
 
+> The `Notification` row covers genuine input/permission prompts only. Claude
+> Code's *non-input* notifications — idle *"waiting for your next prompt"* (which
+> fires on any quiet session ~60 s after it goes idle, including a fresh
+> `/clear`), auth success, and completed MCP forms — are filtered out by
+> `notification_type`, so an idle tab never turns red on its own.
+
 An alert **auto-clears once you focus that tab** (you've seen it), so colors
 don't pile up. Notifications say *which* project and tab — e.g.
 **"Claude needs input: web-ui — ✳ Refactor auth (⌘2)"** — and clicking one
 **jumps to the macOS Space holding that window**, raises that exact window, and
 selects that tab — even with several WezTerm windows spread across Spaces. No
 extra macOS permission required.
+
+**Folder-aware tab titles.** Every tab gets a useful title even with no alert
+active: a tab at a plain shell shows its **working-directory name** (instead of
+`zsh` or a blank), and a Claude Code tab — whose title is the task it's working
+on — is **prefixed with that folder**, e.g. `[wisp] Add search to the UI`, so you
+can tell parallel sessions apart at a glance. A tab you've **renamed yourself**
+(rename UI or `wezterm cli set-tab-title`) keeps its name (an active alert still
+tints it). Turn the whole thing off with `show_folder = false` — tabs then render
+as WezTerm would by default, leaving only the alert tinting.
 
 ## Requirements
 
@@ -84,6 +103,9 @@ claude.apply(config, {
     done      = { bg = '#98c379', fg = '#1e1e2e' },  -- green
   },
   prefix = { attention = '⚠️ ', done = '✅ ' },
+  show_folder   = true,     -- folder-aware tab titles: bare shells show the cwd
+                            -- folder name; Claude tabs are prefixed "[folder] "
+  folder_format = '[%s] ',  -- string.format template for that prefix (%s = folder)
   click_to_focus = true,  -- handle CLAUDE_FOCUS_REQUEST so a toast click jumps to
                           -- the originating window's Space + tab (set false to
                           -- opt out of registering the user-var-changed handler)
@@ -96,7 +118,9 @@ claude.apply(config, {
 local claude = require 'claude-notify'
 wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max)
   local d = claude.decorate(tab)            -- {prefix, bg, fg} or nil
-  local title = (d and d.prefix or '') .. tab.active_pane.title
+  local base = claude.title(tab)            -- folder-aware base title ('' if nothing)
+  if not d and base == '' then return nil end          -- let WezTerm's default win
+  local title = (d and d.prefix or '') .. base
   return {
     { Background = { Color = d and d.bg or '#333' } },
     { Foreground = { Color = d and d.fg or '#ccc' } },
