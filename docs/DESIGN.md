@@ -94,12 +94,15 @@ event from **stdin** (Claude Code delivers it there), extracts
 `notification_type`, and bails on the known non-input set above. Three things
 keep this from misfiring:
 
-- stdin is read **only** for the `ATTENTION` invocation (the `Stop`/`UserPromptSubmit`
-  paths never touch it), with a **bounded** `read -r -d '' -t 1` rather than an
-  unbounded `cat`: Claude Code closes stdin right after the event so the read
-  returns at once, but the 1 s cap means a caller that delivers the event yet
-  *holds stdin open* can never hang the hook. (We also skip the read on an
-  interactive tty, which carries no payload to wait for.)
+- stdin is read with a **bounded** `read -r -d '' -t 1` rather than an unbounded
+  `cat`: Claude Code closes stdin right after the event so the read returns at once,
+  but the 1 s cap means a caller that delivers the event yet *holds stdin open* can
+  never hang the hook. (We also skip the read on an interactive tty, which carries no
+  payload to wait for.) We read it for **every** status — `notification_type` only
+  rides the `ATTENTION` event, but the firing session's `cwd` rides all of them and
+  the stale-pane guard (Trap 6) needs it on `WORKING`/`DONE` too. `Stop` /
+  `UserPromptSubmit` carry no `notification_type`, so the denylist below is simply
+  inert for them.
 - a deny**list**, not an allowlist: an empty/unparseable payload, a Claude Code
   too old to carry `notification_type`, or any *unknown/future* type all fall
   through to the alert — *fail visible*, never silently swallow a real prompt.
@@ -153,14 +156,18 @@ details keep it from misfiring:
   exactly as before. We never suppress a notification we can't *prove* is
   misattributed — consistent with the Trap 5 denylist philosophy.
 
-Scope: the guard lives on the `ATTENTION` path (the only one that reads the
-payload), which is what carries the toast and the red paint — the actual
-complaint. A detached session's later `UserPromptSubmit→WORKING` / `Stop→DONE`
-can still briefly clear/green the launcher pane's tab (those paths don't read
-stdin, by Trap 5's design); extending the same cwd guard to them is a tractable
-follow-up if that flicker proves annoying. No documented hook field marks a
-session as background/agent, so the cwd comparison — not a "is this a bg session"
-test — is the reliable signal.
+Scope: the guard sits before the tab-color write, so it covers **all three**
+statuses. `ATTENTION` is the visible complaint (it carries the toast and the red
+paint), but a detached session's later `UserPromptSubmit→WORKING` / `Stop→DONE`
+would otherwise clear/green the launcher pane's tab too; since we now read the
+payload on every status (Trap 5), the same cwd comparison drops those misdirected
+recolors as well. No documented hook field marks a session as background/agent, so
+the cwd comparison — not a "is this a bg session" test — is the reliable signal.
+
+One residual stays by design: a **same-project** background session firing while
+its launcher pane still holds that project has matching roots, so it's *not*
+suppressed (the folder label is correct even if it's a different session). Only
+cross-project misattribution — the actual bug — is dropped.
 
 ## Why the tab clears on focus (and why it's done in Lua)
 

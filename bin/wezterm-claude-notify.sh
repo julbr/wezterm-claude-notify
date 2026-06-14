@@ -33,21 +33,23 @@ fallback_msg="${2:-}"
 # Only meaningful inside WezTerm.
 [ -n "${WEZTERM_PANE:-}" ] || exit 0
 
-# Claude Code delivers the hook's JSON event on stdin. For the Notification hook
-# (status ATTENTION) we read it so we can tell a real input/permission request
-# from a non-input Notification (idle "waiting for your next prompt", auth
-# success, …) that must NOT turn the tab red. The read is BOUNDED on purpose:
-# `read -t 1` caps it at one second so a caller that delivers the event but holds
-# stdin open can never hang the hook — Claude Code closes stdin right after the
-# event, so the normal path still returns instantly; `-d ''` slurps the whole
-# payload (incl. a pretty-printed multi-line one). Read only for ATTENTION (the
-# DONE/WORKING paths never touch stdin), and skip it on an interactive terminal,
-# which carries no payload to wait for. On timeout or no payload, hook_payload is
-# empty and we fall through to alerting (fail visible). `|| true`: a no-delimiter
-# EOF/timeout makes read exit non-zero, which is expected, not an error.
+# Claude Code delivers the hook's JSON event on stdin, for EVERY hook. We read it
+# (when present) to extract two things: the firing session's own `cwd` — used by
+# all three statuses to detect a stale/inherited $WEZTERM_PANE (a background/agent
+# session pointing at someone else's pane; see the guard below) so we don't color
+# or toast the wrong tab — and, for ATTENTION, the `notification_type`, which tells
+# a real input/permission request from a non-input Notification (idle "waiting for
+# your next prompt", auth success, …) that must NOT turn the tab red. The read is
+# BOUNDED on purpose: `read -t 1` caps it at one second so a caller that delivers
+# the event but holds stdin open can never hang the hook — Claude Code closes stdin
+# right after the event, so the normal path still returns instantly; `-d ''` slurps
+# the whole payload (incl. a pretty-printed multi-line one). Skip it on an
+# interactive terminal, which carries no payload to wait for. On timeout or no
+# payload, hook_payload is empty and we fall through (fail visible). `|| true`: a
+# no-delimiter EOF/timeout makes read exit non-zero, which is expected, not an error.
 hook_payload=""
 hook_cwd=""
-if [ "$status" = "ATTENTION" ] && [ ! -t 0 ]; then
+if [ ! -t 0 ]; then
   IFS= read -r -d '' -t 1 hook_payload || true
 fi
 
@@ -85,6 +87,8 @@ if [ -n "$hook_payload" ]; then
   # One parse yields both the notification_type (for the denylist below) and the
   # FIRING session's own cwd (for the stale-pane guard further down). Tab-delimited;
   # cwd can't contain a tab, and a parse failure yields a lone tab (both empty).
+  # WORKING/DONE payloads carry no notification_type, so ntype is empty for them and
+  # the denylist below is a no-op there — they only need cwd for the guard.
   parsed="$(printf '%s' "$hook_payload" | "$PYTHON" -c 'import json,sys
 try:
     d = json.load(sys.stdin)
@@ -151,6 +155,8 @@ fi
 # <project>/.claude/worktrees/<name>, so normalize both to the project root first.
 # Skipped when either cwd is unknown (empty payload, older Claude, lookup miss) so the
 # normal foreground path is untouched — fail visible, never swallow a real prompt.
+# This sits before the tab-color write, so it guards ALL THREE statuses: a stray
+# WORKING/DONE from a background session no longer recolors the launcher pane's tab.
 project_root() {  # owning project root: drop a trailing slash + any Claude worktree suffix
   local p="${1%/}"
   case "$p" in */.claude/worktrees/*) p="${p%%/.claude/worktrees/*}" ;; esac
