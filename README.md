@@ -109,7 +109,43 @@ claude.apply(config, {
   click_to_focus = true,  -- handle CLAUDE_FOCUS_REQUEST so a toast click jumps to
                           -- the originating window's Space + tab (set false to
                           -- opt out of registering the user-var-changed handler)
+  agents_status = true,   -- show background / `claude agents` workers that are
+                          -- awaiting your input in the right status bar (see below)
+  agents_status_interval = 3,         -- seconds between polls of the daemon state
+  agents_status_max      = 4,         -- max names to list before "· +N more"
+  agents_status_color    = '#e5c07b', -- color of the status text (amber by default)
 })
+```
+
+### Agents awaiting-input status
+
+A background task or a `claude agents` worker runs **detached** — it has no pane
+of its own (it inherited a frozen `$WEZTERM_PANE` from whatever launched it), so
+its "needs input" toast can't reliably focus a tab and its tab can't be tinted:
+there is no correct tab to point at. Instead, this module surfaces that state
+where it *is* reliable. The Claude daemon writes each worker's status to
+`~/.claude/jobs/<id>/state.json` in real time — flipping `state` to `"blocked"`
+the moment a worker awaits you — so the module polls those files (gated by the
+live `~/.claude/daemon/roster.json`, so finished jobs never count) and lists the
+blocked workers **by name** in the right status bar of every window:
+
+```
+⏳ 2 agents need input · teleport-migration · monorepo-rules
+```
+
+It's pane-independent: immune to the stale-pane problem, to having several
+`claude agents` UIs open, and to tab renames. The status clears when nothing is
+waiting. Set `agents_status = false` to turn it off.
+
+**Already drive `update-status` yourself?** Set `agents_status = false` and fold
+the string into your own handler:
+
+```lua
+wezterm.on('update-status', function(window, pane)
+  local agents = claude.agents_status_text()      -- '' when none are waiting
+  -- ...combine `agents` with your own right-status content...
+  window:set_right_status(agents)
+end)
 ```
 
 **Already have your own `format-tab-title`?** Compose instead of replacing:

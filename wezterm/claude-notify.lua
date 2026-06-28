@@ -49,9 +49,26 @@
 --   show_folder    = true|false  -- folder-aware titles (default true; see above)
 --   folder_format  = '[%s] '     -- string.format template for the folder prefix on
 --                                   a Claude task title (%s = the cwd folder name)
+--   agents_status  = true|false  -- AGENTS AWAITING-INPUT STATUS (default true; see below)
+--   agents_status_interval = 3   -- seconds between polls of the daemon job state
+--   agents_status_max      = 4   -- max agent names to list before "· +N more"
+--   agents_status_color    = '#e5c07b'  -- foreground color of the right-status text
 --   notification_handling = 'SuppressFromFocusedTab' | 'AlwaysShow' | ...
 --       (only relevant if you fall back to WezTerm's native OSC toasts; the
 --        terminal-notifier path used by default is unaffected by this.)
+--
+-- AGENTS AWAITING-INPUT STATUS: a daemon-managed background / `claude agents`
+-- worker has NO pane of its own (it inherited a frozen $WEZTERM_PANE from its
+-- launcher), so its "needs input" toast can't reliably focus a tab and its tab
+-- can't be tinted — there is no correct tab. Instead we surface that state where
+-- it IS reliable: the daemon writes each worker's status to
+-- ~/.claude/jobs/<id>/state.json in real time, flipping `state` to "blocked" the
+-- moment a worker awaits you. This module polls those files (gated by the live
+-- ~/.claude/daemon/roster.json so finished jobs never count) and shows the blocked
+-- agents BY NAME in the WezTerm right status bar of every window — pane-independent,
+-- immune to stale panes, multiple `claude agents` UIs, and tab renames. The status
+-- is cleared when nothing awaits. If you already drive update-status yourself, set
+-- agents_status=false and call claude.agents_status_text() from your own handler.
 
 local wezterm = require 'wezterm'
 
@@ -77,6 +94,11 @@ local defaults = {
   -- name so you can tell sessions apart, e.g. "[wisp] Add search to the UI".
   show_folder = true,
   folder_format = '[%s] ', -- string.format template for the Claude-title prefix; %s = folder
+  -- Agents awaiting-input status (right status bar). See the header comment.
+  agents_status = true,
+  agents_status_interval = 3,        -- seconds between polls of the daemon job state
+  agents_status_max = 4,             -- max agent names to list before "· +N more"
+  agents_status_color = '#e5c07b',   -- amber, to read as distinct from the red alert tabs
 }
 
 local opts = defaults
@@ -104,6 +126,11 @@ function M.configure(o)
     click_to_focus = (o.click_to_focus == nil) and defaults.click_to_focus or o.click_to_focus,
     show_folder = (o.show_folder == nil) and defaults.show_folder or o.show_folder,
     folder_format = o.folder_format or defaults.folder_format,
+    -- explicit nil check so agents_status = false is honored (not coerced to true)
+    agents_status = (o.agents_status == nil) and defaults.agents_status or o.agents_status,
+    agents_status_interval = o.agents_status_interval or defaults.agents_status_interval,
+    agents_status_max = o.agents_status_max or defaults.agents_status_max,
+    agents_status_color = o.agents_status_color or defaults.agents_status_color,
     notification_handling = o.notification_handling,
   }
   return M
@@ -211,6 +238,92 @@ function M.on_user_var(window, pane, name, value)
   pcall(function() if window then window:focus() end end)     -- raise window + switch Space
 end
 
+-- === Agents awaiting-input status =========================================
+-- Read the daemon's job state files and report which `claude agents` / background
+-- workers are awaiting your input. See the header comment for the full rationale.
+
+local function read_file(path)
+  local f = io.open(path, 'r')
+  if not f then return nil end
+  local s = f:read('*a')
+  f:close()
+  return s
+end
+
+-- wezterm.json_parse raises on malformed JSON (e.g. a state.json caught mid-write),
+-- so guard it and treat any failure as "no data this cycle" (it reappears next poll).
+local function json_parse(s)
+  if not s or s == '' then return nil end
+  local ok, v = pcall(wezterm.json_parse, s)
+  if ok then return v end
+  return nil
+end
+
+-- Names of daemon-managed workers whose state is "blocked" (awaiting your input).
+-- We iterate the LIVE roster (supervisorPid + a `workers` map; entries carry
+-- dispatch.short / sessionId) rather than globbing the jobs dir, so a finished
+-- worker — whose state.json lingers at "done" — never counts. The job dir is keyed
+-- by the short id (== state.json daemonShort == first sessionId segment).
+local function blocked_agent_names()
+  local home = wezterm.home_dir or os.getenv('HOME')
+  if not home or home == '' then return {} end
+  local roster = json_parse(read_file(home .. '/.claude/daemon/roster.json'))
+  if type(roster) ~= 'table' or type(roster.workers) ~= 'table' then return {} end
+  local names = {}
+  for _, w in pairs(roster.workers) do
+    if type(w) == 'table' then
+      local short = (w.dispatch and w.dispatch.short)
+        or (type(w.sessionId) == 'string' and w.sessionId:match('^[^-]+'))
+      if short then
+        local st = json_parse(read_file(home .. '/.claude/jobs/' .. short .. '/state.json'))
+        if type(st) == 'table' and st.state == 'blocked' then
+          local nm = st.name
+          if type(nm) ~= 'string' or nm == '' then        -- unnamed: fall back to the cwd leaf
+            nm = type(st.cwd) == 'string' and st.cwd:gsub('/+$', ''):match('([^/]+)$') or nil
+          end
+          names[#names + 1] = nm or 'agent'
+        end
+      end
+    end
+  end
+  return names
+end
+
+local function format_agents(names)
+  local n = #names
+  if n == 0 then return '' end
+  table.sort(names)                  -- stable display order (roster iteration order isn't)
+  local max = opts.agents_status_max or 4
+  local shown, extra = names, 0
+  if n > max then
+    shown = {}
+    for i = 1, max do shown[i] = names[i] end
+    extra = n - max
+  end
+  local verb = (n == 1) and 'needs' or 'need'
+  local s = '⏳ ' .. n .. ' agent' .. ((n == 1) and '' or 's') .. ' ' .. verb
+    .. ' input · ' .. table.concat(shown, ' · ')
+  if extra > 0 then s = s .. ' · +' .. extra .. ' more' end
+  return s
+end
+
+-- Throttled, pcall-guarded accessor returning the "agents awaiting input" string
+-- ('' when none). update-status fires ~1/s per window; the cache (shared across all
+-- windows) caps the actual file reads at one batch per agents_status_interval.
+-- Public so a user with their own update-status handler can compose it.
+local agents_cache = { at = -1, text = '' }
+function M.agents_status_text()
+  local now = os.time()
+  local interval = opts.agents_status_interval or 3
+  if agents_cache.at >= 0 and (now - agents_cache.at) < interval then
+    return agents_cache.text
+  end
+  agents_cache.at = now
+  local ok, text = pcall(function() return format_agents(blocked_agent_names()) end)
+  agents_cache.text = (ok and text) or ''
+  return agents_cache.text
+end
+
 -- Register standalone format-tab-title (folder-aware title + alert tinting) and,
 -- unless disabled, a user-var-changed handler (click-to-focus). The handler
 -- returns nil only when there's nothing to show (no alert, no title, no folder),
@@ -237,6 +350,19 @@ function M.apply(config, o)
   end)
   if opts.click_to_focus then
     wezterm.on('user-var-changed', M.on_user_var)
+  end
+  if opts.agents_status then
+    wezterm.on('update-status', function(window)
+      local text = M.agents_status_text()
+      if text == '' then
+        window:set_right_status('')
+      else
+        window:set_right_status(wezterm.format({
+          { Foreground = { Color = opts.agents_status_color } },
+          { Text = text .. '  ' },           -- trailing pad so it isn't flush to the edge
+        }))
+      end
+    end)
   end
   return M
 end
